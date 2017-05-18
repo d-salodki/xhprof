@@ -60,8 +60,18 @@
 #   define SET_AFFINITY(pid, size, mask)       \
         thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY, mask, \
                           THREAD_AFFINITY_POLICY_COUNT)
+#elif defined(_AIX) && _AIX
+#include <sys/time.h>
+#include <sys/systemcfg.h>
+#    define cpu_set_t  int
+#    define GET_AFFINITY(pid, size, mask) (0)
+#    define SET_AFFINITY(pid, size, mask) (0)
+#    define CPU_ZERO(mask) (0)
+#    define CPU_SET(cpu_id, new_mask) (0)
+typedef timebasestruct_t hp_time_t;
 #else
 /* For sched_getaffinity, sched_setaffinity */
+typedef uint64 hp_time_t;
 # include <sched.h>
 # define SET_AFFINITY(pid, size, mask) sched_setaffinity(0, size, mask)
 # define GET_AFFINITY(pid, size, mask) sched_getaffinity(0, size, mask)
@@ -135,7 +145,7 @@ typedef unsigned char uint8;
 typedef struct hp_entry_t {
   char                   *name_hprof;                       /* function name */
   int                     rlvl_hprof;        /* recursion level for function */
-  uint64                  tsc_start;         /* start value for TSC counter  */
+  hp_time_t               tsc_start;         /* start value for TSC counter  */
   long int                mu_start_hprof;                    /* memory usage */
   long int                pmu_start_hprof;              /* peak memory usage */
   struct rusage           ru_start_hprof;             /* user/sys time start */
@@ -192,9 +202,9 @@ typedef struct hp_global_t {
 
   /* Global to track the time of the last sample in time and ticks */
   struct timeval   last_sample_time;
-  uint64           last_sample_tsc;
+  hp_time_t        last_sample_tsc;
   /* XHPROF_SAMPLING_INTERVAL in ticks */
-  uint64           sampling_interval_tsc;
+  hp_time_t        sampling_interval_tsc;
 
   /* This array is used to store cpu frequencies for all available logical
    * cpus.  For now, we assume the cpu frequencies will not change for power
@@ -272,7 +282,7 @@ static void hp_begin(long level, long xhprof_flags TSRMLS_DC);
 static void hp_stop(TSRMLS_D);
 static void hp_end(TSRMLS_D);
 
-static inline uint64 cycle_timer();
+static inline hp_time_t cycle_timer();
 static double get_cpu_frequency();
 static void clear_frequencies();
 
@@ -1193,6 +1203,7 @@ void hp_sample_stack(hp_entry_t  **entries  TSRMLS_DC) {
  * @author veeve
  */
 void hp_sample_check(hp_entry_t **entries  TSRMLS_DC) {
+#ifndef _AIX
   /* Validate input */
   if (!entries || !(*entries)) {
     return;
@@ -1212,7 +1223,7 @@ void hp_sample_check(hp_entry_t **entries  TSRMLS_DC) {
     /* sample the stack */
     hp_sample_stack(entries  TSRMLS_CC);
   }
-
+#endif
   return;
 }
 
@@ -1229,12 +1240,18 @@ void hp_sample_check(hp_entry_t **entries  TSRMLS_DC) {
  * @return 64 bit unsigned integer
  * @author cjiang
  */
-static inline uint64 cycle_timer() {
+static hp_time_t cycle_timer() {
+#if defined(_AIX) && _AIX
+    hp_time_t _time;
+    mread_real_time(&_time, TIMEBASE_SZ);
+    return _time;
+#else
   uint32 __a,__d;
   uint64 val;
   asm volatile("rdtsc" : "=a" (__a), "=d" (__d));
   (val) = ((uint64)__a) | (((uint64)__d)<<32);
   return val;
+#endif
 }
 
 /**
@@ -1248,6 +1265,8 @@ static inline uint64 cycle_timer() {
  * @author cjiang
  */
 int bind_to_cpu(uint32 cpu_id) {
+#if defined(_AIX) && _AIX
+#else
   cpu_set_t new_mask;
 
   CPU_ZERO(&new_mask);
@@ -1260,7 +1279,7 @@ int bind_to_cpu(uint32 cpu_id) {
 
   /* record the cpu_id the process is bound to. */
   hp_globals.cur_cpu_id = cpu_id;
-
+#endif
   return 0;
 }
 
@@ -1291,8 +1310,13 @@ static void incr_us_interval(struct timeval *start, uint64 incr) {
  *
  * @author cjiang
  */
-static inline double get_us_from_tsc(uint64 count, double cpu_frequency) {
-  return count / cpu_frequency;
+static inline double get_us_from_tsc(hp_time_t count, double cpu_frequency) {
+#if defined(_AIX) && _AIX
+    time_base_to_time(&count, TIMEBASE_SZ);
+    return (double)count.tb_high*1000000.0+(double)count.tb_low/1000.0;
+#else
+    return count / cpu_frequency;
+#endif
 }
 
 /**
@@ -1304,10 +1328,11 @@ static inline double get_us_from_tsc(uint64 count, double cpu_frequency) {
  *
  * @author veeve
  */
+#ifndef _AIX
 static inline uint64 get_tsc_from_us(uint64 usecs, double cpu_frequency) {
   return (uint64) (usecs * cpu_frequency);
 }
-
+#endif
 /**
  * This is a microbenchmark to get cpu frequency the process is running on. The
  * returned value is used to convert TSC counter values to microseconds.
@@ -1316,6 +1341,7 @@ static inline uint64 get_tsc_from_us(uint64 usecs, double cpu_frequency) {
  * @author cjiang
  */
 static double get_cpu_frequency() {
+#ifndef _AIX
   struct timeval start;
   struct timeval end;
 
@@ -1333,6 +1359,9 @@ static double get_cpu_frequency() {
   }
   uint64 tsc_end = cycle_timer();
   return (tsc_end - tsc_start) * 1.0 / (get_us_interval(&start, &end));
+#else
+  return 0;
+#endif
 }
 
 /**
@@ -1341,6 +1370,7 @@ static double get_cpu_frequency() {
  * @author cjiang
  */
 static void get_all_cpu_frequencies() {
+#ifndef _AIX
   int id;
   double frequency;
 
@@ -1368,6 +1398,7 @@ static void get_all_cpu_frequencies() {
     }
     hp_globals.cpu_frequencies[id] = frequency;
   }
+#endif
 }
 
 /**
@@ -1380,6 +1411,7 @@ static void get_all_cpu_frequencies() {
  * @author cjiang
  */
 int restore_cpu_affinity(cpu_set_t * prev_mask) {
+#ifndef _AIX
   if (SET_AFFINITY(0, sizeof(cpu_set_t), prev_mask) < 0) {
     perror("restore setaffinity");
     return -1;
@@ -1387,6 +1419,7 @@ int restore_cpu_affinity(cpu_set_t * prev_mask) {
   /* default value ofor cur_cpu_id is 0. */
   hp_globals.cur_cpu_id = 0;
   return 0;
+#endif
 }
 
 /**
@@ -1481,6 +1514,7 @@ void hp_mode_common_endfn(hp_entry_t **entries, hp_entry_t *current TSRMLS_DC) {
  *
  * @author veeve
  */
+#ifndef _AIX
 void hp_mode_sampled_init_cb(TSRMLS_D) {
   struct timeval  now;
   uint64 truncated_us;
@@ -1507,7 +1541,7 @@ void hp_mode_sampled_init_cb(TSRMLS_D) {
   hp_globals.sampling_interval_tsc =
     get_tsc_from_us(XHPROF_SAMPLING_INTERVAL, cpu_freq);
 }
-
+#endif
 
 /**
  * ************************************
@@ -1564,7 +1598,7 @@ void hp_mode_sampled_beginfn_cb(hp_entry_t **entries,
 zval * hp_mode_shared_endfn_cb(hp_entry_t *top,
                                char          *symbol  TSRMLS_DC) {
   zval    *counts;
-  uint64   tsc_end;
+  hp_time_t   tsc_end;
 
   /* Get end tsc counter */
   tsc_end = cycle_timer();
@@ -1577,8 +1611,7 @@ zval * hp_mode_shared_endfn_cb(hp_entry_t *top,
   /* Bump stats in the counts hashtable */
   hp_inc_count(counts, "ct", 1  TSRMLS_CC);
 
-  hp_inc_count(counts, "wt", get_us_from_tsc(tsc_end - top->tsc_start,
-        hp_globals.cpu_frequencies[hp_globals.cur_cpu_id]) TSRMLS_CC);
+  hp_inc_count(counts, "wt", (long)(get_us_from_tsc(tsc_end, hp_globals.cpu_frequencies[hp_globals.cur_cpu_id]) - get_us_from_tsc(top->tsc_start, hp_globals.cpu_frequencies[hp_globals.cur_cpu_id])) TSRMLS_CC);
   return counts;
 }
 
@@ -1864,11 +1897,13 @@ static void hp_begin(long level, long xhprof_flags TSRMLS_DC) {
         hp_globals.mode_cb.begin_fn_cb = hp_mode_hier_beginfn_cb;
         hp_globals.mode_cb.end_fn_cb   = hp_mode_hier_endfn_cb;
         break;
+#ifndef _AIX
       case XHPROF_MODE_SAMPLED:
         hp_globals.mode_cb.init_cb     = hp_mode_sampled_init_cb;
         hp_globals.mode_cb.begin_fn_cb = hp_mode_sampled_beginfn_cb;
         hp_globals.mode_cb.end_fn_cb   = hp_mode_sampled_endfn_cb;
         break;
+#endif
     }
 
     /* one time initializations */
